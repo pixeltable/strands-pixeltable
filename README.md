@@ -51,9 +51,9 @@ agent = Agent(
 
 `MemoryManager` registers `search_memory`. `add_tool_config=True` also registers `add_memory`. With the default `injection=True`, retrieved rows are prepended to the model input and are not written into the conversation history.
 
-The table is created on first use. Columns are `memory_id` (primary key), `content`, `kind` (`note` or `message`), `role`, `metadata`, `session_id`, and `created_at`. The store adds a stored computed column `content_chars` and an embedding index named `content_embedding` on `content`. `store.table` is that table.
+The table is created on first use. Columns are `memory_id` (primary key), `content`, `kind` (`note` or `message`), `role`, `metadata`, `session_id`, and `created_at`. The store adds a btree index on `session_id` and an embedding index named `content_embedding` on `content`. `store.table` is that table.
 
-`add_messages` stores each text block as `"<role>: <text>"`. A message `tracking_id` becomes the primary key `msg:<tracking_id>`, so a retry does not insert a second row. Tool-only messages are skipped.
+`add_messages` stores each message containing text as `"<role>: <text>"`, joining multiple text blocks with newlines. A message `tracking_id` becomes the primary key `msg:<tracking_id>`, so a retry does not insert a second row. Tool-only messages are skipped.
 
 `extraction=True` opts into Strands background extraction. This store implements `add_messages`, so the manager writes the raw messages here and does not make a separate extraction model call. The default is off.
 
@@ -78,7 +78,7 @@ docs = pxt.create_table(
 )
 if docs.count() == 0:
     docs.insert([{"topic": "expenses", "text": "Meals during business travel are reimbursed up to 60 EUR per day."}])
-docs.add_embedding_index("text", embedding=embed, if_exists="ignore")
+docs.add_embedding_index("text", string_embed=embed, if_exists="ignore")
 
 memory = PixeltableMemoryStore(table_name="handbook.memory", embedding=embed)
 agent = Agent(
@@ -96,7 +96,9 @@ print(agent("Can I expense a 75 EUR dinner? Remember that I travel monthly."))
 - `query_table` selects rows. `where` is a JSON object of equality filters (`{"status": "open"}`). Timestamp, date, and UUID values are ISO strings.
 - `similarity_search` runs `column.similarity`. Pass `query` for text or `image` for a file path or URL. The column needs an embedding index for that modality. Pass `idx` when the column has more than one embedding index.
 
-`query_table` and `similarity_search` do not insert, update, or delete. Default columns skip media, array, binary, and computed columns that are not stored. A named media column is returned as a file URL. Version handles (`docs:3`) are refused. `max_rows` (20) and `max_chars` (8000) bound each result. `truncated` is true when a cap drops data.
+`query_table` and `similarity_search` do not insert, update, or delete. Default columns skip media, array, binary, and computed columns that are not stored. Explicitly selecting an unstored computed column is rejected so reading does not execute its function. A named media column is returned as a file URL. Version handles (`docs:3`) are refused.
+
+`max_rows` (20) and `max_chars` (8000) bound query, similarity, and recall results, including their JSON envelope and metadata. `truncated` is true when a cap drops data; if even a shortened row cannot fit, the result list is empty. A budget too small for the result envelope raises `ValueError`.
 
 [`examples/agent_with_memory.py`](examples/agent_with_memory.py) builds the same agent. It stores a note and searches without a model. `RUN_AGENT=1` invokes the model.
 

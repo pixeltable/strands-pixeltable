@@ -23,7 +23,7 @@ from strands.memory import MemoryManager
 from strands_pixeltable import PixeltableMemoryStore, pixeltable_tools, sentence_transformer_embedding
 
 
-def build_handbook(embedding: object) -> None:
+def build_handbook(embedding: pxt.Function) -> None:
     """Create a one-row handbook and an embedding index, if they are not there yet."""
     pxt.create_dir("examples", if_exists="ignore")
     docs = pxt.create_table(
@@ -40,7 +40,7 @@ def build_handbook(embedding: object) -> None:
                 }
             ]
         )
-    docs.add_embedding_index("text", embedding=embedding, if_exists="ignore")
+    docs.add_embedding_index("text", string_embed=embedding, if_exists="ignore")
 
 
 async def remember_and_search(store: PixeltableMemoryStore) -> None:

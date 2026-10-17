@@ -26,8 +26,7 @@ _DEFAULT_MAX_SEARCH_RESULTS = 5
 _TABLE_COMMENT = "Memories for a Strands agent. Managed by strands-pixeltable."
 _MAX_ID_CHARS = 200
 
-# Base columns the store owns. Derived columns (content_chars, the embedding index)
-# are added on first writable open and are not part of this check.
+# Base columns the store owns. Indexes are added on first writable open.
 _BASE_COLUMNS: dict[str, tuple[str, bool]] = {
     "memory_id": ("String", False),
     "content": ("String", False),
@@ -95,8 +94,8 @@ class PixeltableMemoryStore(MemoryStore):
     message that has text. ``search`` orders rows by ``content.similarity`` against
     the ``content_embedding`` index.
 
-    The first writable open creates the table, a stored ``content_chars`` computed
-    column, a btree on ``session_id``, and the embedding index on ``content``.
+    The first writable open creates the table, a btree on ``session_id``, and the
+    embedding index on ``content``.
     Pass ``embedding`` as a module-level Pixeltable UDF or a ``.using()`` binding.
     Omit it to use :func:`strands_pixeltable.sentence_transformer_embedding`
     (install the ``local`` extra). A later open reuses the index and does not
@@ -243,7 +242,8 @@ class PixeltableMemoryStore(MemoryStore):
     def _ensure_table(self) -> pxt.Table:
         if self._table is not None:
             return self._table
-        self._ensure_dirs()
+        if self.writable:
+            self._ensure_dirs()
         table: pxt.Table | None
         if self._if_exists == "replace":
             if not self.writable:
@@ -315,7 +315,7 @@ class PixeltableMemoryStore(MemoryStore):
         metadata = _metadata_dict(table)
         if self._index_ok(metadata):
             if self.writable:
-                self._ensure_access_columns(table, metadata)
+                self._ensure_session_index(table, metadata)
             return
         if not self.writable:
             raise ValueError(
@@ -324,7 +324,7 @@ class PixeltableMemoryStore(MemoryStore):
             )
         embedding = self._embedding if self._embedding is not None else sentence_transformer_embedding()
         self._embedding = embedding
-        self._ensure_access_columns(table, metadata)
+        self._ensure_session_index(table, metadata)
         table.add_embedding_index(
             "content",
             string_embed=embedding,
@@ -336,11 +336,8 @@ class PixeltableMemoryStore(MemoryStore):
         if not self._index_ok(_metadata_dict(table)):
             raise RuntimeError(f"Failed to create embedding index {_CONTENT_INDEX!r} on {self.table_name!r}")
 
-    def _ensure_access_columns(self, table: pxt.Table, metadata: Mapping[str, Any]) -> None:
-        columns = metadata.get("columns") or {}
+    def _ensure_session_index(self, table: pxt.Table, metadata: Mapping[str, Any]) -> None:
         indexes = metadata.get("indexes") or {}
-        if "content_chars" not in columns:
-            table.add_computed_column(content_chars=table.content.len(), if_exists="ignore")
         if _SESSION_INDEX not in indexes:
             table.add_btree_index("session_id", idx_name=_SESSION_INDEX, if_exists="ignore")
 

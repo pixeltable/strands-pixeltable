@@ -54,9 +54,6 @@ async def test_add_and_search_ranks_exact_text_first(root: str) -> None:
     assert found[0].metadata["score"] >= found[1].metadata["score"]  # type: ignore[index]
     assert store.table.count() == 2
 
-    chars = list(store.table.select(store.table.content_chars).collect())
-    assert sorted(row["content_chars"] for row in chars) == [22, 27]
-
 
 async def test_search_limit_empty_query_and_duplicate_id(root: str) -> None:
     store = _store(root)
@@ -138,6 +135,7 @@ async def test_read_only_missing_table(root: str) -> None:
     store = PixeltableMemoryStore(table_name=f"{root}.missing", writable=False, embedding=tiny_embed)
     with pytest.raises(ValueError, match="read-only"):
         await store.search("anything")
+    assert root not in pxt.list_dirs()
 
 
 async def test_default_embedding_is_used_when_the_index_is_missing(root: str, monkeypatch: pytest.MonkeyPatch) -> None:

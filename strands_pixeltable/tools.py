@@ -9,7 +9,9 @@ from typing import Any, cast
 from uuid import UUID
 
 import pixeltable as pxt
+from pixeltable.index import EmbeddingIndex
 from strands import tool
+from strands.memory import SearchOptions
 from strands.types.tools import AgentTool
 
 from strands_pixeltable._types import column_base
@@ -33,6 +35,10 @@ _WHERE_PARSERS: dict[str, Callable[[str], Any]] = {
     "Date": date.fromisoformat,
     "UUID": UUID,
 }
+
+
+class _RecallOptions(SearchOptions, total=False):
+    session_id: str
 
 
 def _norm(path: str) -> str:
@@ -98,36 +104,44 @@ def _parse_where(where: str | dict[str, Any] | None) -> dict[str, Any] | None:
     raise ValueError("where must be a JSON object")
 
 
-def _bounded(table: str, rows: list[dict[str, Any]], *, has_more: bool, max_chars: int) -> dict[str, Any]:
+def _bounded(
+    context: dict[str, str],
+    rows: list[dict[str, Any]],
+    *,
+    has_more: bool,
+    max_chars: int,
+    row_key: str = "rows",
+) -> dict[str, Any]:
     """Keep leading rows while the JSON payload fits in ``max_chars``."""
-    empty = {"table": table, "rows": [], "truncated": True}
-    if len(json.dumps(empty, ensure_ascii=False)) > max_chars:
-        return empty
+    empty = {**context, row_key: [], "truncated": True}
+    if len(json.dumps({**empty, "truncated": has_more}, ensure_ascii=False)) > max_chars:
+        raise ValueError("max_chars is too small for the result envelope")
     kept: list[dict[str, Any]] = []
     truncated = has_more
     for row in rows:
-        trial = {"table": table, "rows": [*kept, row], "truncated": truncated}
+        trial = {**context, row_key: [*kept, row], "truncated": truncated}
         if len(json.dumps(trial, ensure_ascii=False)) <= max_chars:
             kept.append(row)
             continue
         truncated = True
         if not kept:
-            kept.append(_shrink_row(row, max_chars - len(json.dumps(empty, ensure_ascii=False))))
+            clipped = _shrink_row(row, max_chars - len(json.dumps(empty, ensure_ascii=False)))
+            if clipped is not None:
+                kept.append(clipped)
         break
-    return {"table": table, "rows": kept, "truncated": truncated}
+    return {**context, row_key: kept, "truncated": truncated}
 
 
-def _shrink_row(row: dict[str, Any], budget: int) -> dict[str, Any]:
+def _shrink_row(row: dict[str, Any], budget: int) -> dict[str, Any] | None:
     clipped = dict(row)
-    for _ in range(32):
-        if len(json.dumps(clipped, ensure_ascii=False)) <= max(budget, 8):
-            return clipped
+    while len(json.dumps(clipped, ensure_ascii=False)) > budget:
         strings = [key for key, value in clipped.items() if isinstance(value, str) and len(value) > 3]
         if not strings:
-            return {key: ("..." if isinstance(value, str) else None) for key, value in clipped.items()}
+            return None
         key = max(strings, key=lambda name: len(str(clipped[name])))
         text = str(clipped[key])
-        clipped[key] = text[: max(0, len(text) // 2)] + "..."
+        shorter = text[: len(text) // 2] + "..."
+        clipped[key] = shorter if len(shorter) < len(text) else "..."
     return clipped
 
 
@@ -230,11 +244,13 @@ class _Catalog:
                     else opened[column].similarity(string=text)
                 )
             else:
-                similarity = (
-                    opened[column].similarity(image=image_path, idx=idx)
-                    if idx is not None
-                    else opened[column].similarity(image=image_path)
-                )
+                # Public index metadata has display strings, not supported modalities.
+                # Resolve exactly as Pixeltable does, before similarity() opens/fetches the image.
+                ref = opened[column]
+                index_md = opened._tbl_path.get_idx_md(ref.col_md.qcolid, idx, EmbeddingIndex)
+                if not index_md.init_args.get("image_embed"):
+                    raise ValueError(f"Embedding index {index_md.name!r} does not have an image embedding")
+                similarity = ref.similarity(image=image_path, idx=index_md.name)
             projected = self._project(opened, selected, metadata, **{score_name: similarity})
             ranked = projected.order_by(similarity, asc=False)
         except (pxt.Error, TypeError, ValueError, OSError) as exc:
@@ -292,6 +308,8 @@ class _Catalog:
             if name not in column_md:
                 raise ValueError(f"Unknown column {name!r} on {path!r}. Call describe_table.")
             info = column_md[name]
+            if isinstance(info, dict) and info.get("is_computed") and not info.get("is_stored"):
+                raise ValueError(f"Column {name!r} is computed on read and cannot be selected.")
             type_ = info.get("type_") if isinstance(info, dict) else None
             if _is_skipped(type_):
                 continue
@@ -356,7 +374,7 @@ class _Catalog:
             raise ValueError(str(exc)) from exc
         has_more = len(fetched) > count
         rows = [_row(dict(row)) for row in fetched[:count]]
-        return _bounded(_norm(table), rows, has_more=has_more, max_chars=self._max_chars)
+        return _bounded({"table": _norm(table)}, rows, has_more=has_more, max_chars=self._max_chars)
 
 
 def pixeltable_tools(
@@ -381,7 +399,8 @@ def pixeltable_tools(
         tables: Allowlist. Use ``["*"]`` for the whole catalog.
         memory: Optional memory store backing ``remember`` and ``recall``.
         max_rows: Cap on rows returned by one call.
-        max_chars: Cap on the JSON size of one result.
+        max_chars: Cap on the JSON size of query, similarity, and recall results.
+            Raises if the result envelope alone exceeds this budget.
     """
     if not isinstance(tables, list) or not tables:
         raise ValueError("tables must be a non-empty allowlist; pass ['*'] to allow the whole catalog")
@@ -449,32 +468,24 @@ def _recall_tool(memory: PixeltableMemoryStore, *, max_rows: int, max_chars: int
             query: Text to embed and compare with stored notes and messages.
             limit: Maximum number of hits. Capped by the tool's row limit.
             session_id: When set, only rows from this session are searched.
+                An empty string searches every session.
 
         Returns:
-            Ranked memories. ``truncated`` is true when a hit was shortened.
+            Ranked memories. ``truncated`` is true when a cap drops data.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be an integer >= 1")
         fetch = min(limit, max_rows)
-        options: dict[str, Any] = {"max_search_results": fetch}
-        if session_id:
+        options: _RecallOptions = {"max_search_results": fetch + 1}
+        if session_id is not None:
             options["session_id"] = session_id
-        entries = await memory.search(query, options)  # type: ignore[arg-type]
+        entries = await memory.search(query, options)
         memories: list[dict[str, Any]] = []
-        truncated = False
-        used = 0
-        for entry in entries:
-            content = entry.content
-            if len(content) > max_chars:
-                content = content[: max(0, max_chars - 3)] + "..."
-                truncated = True
-            if used + len(content) > max_chars and memories:
-                truncated = True
-                break
+        for entry in entries[:fetch]:
             meta = entry.metadata or {}
             memories.append(
                 {
-                    "content": content,
+                    "content": entry.content,
                     "score": round(float(meta.get("score", 0.0)), 6),
                     "memory_id": meta.get("memory_id"),
                     "kind": meta.get("kind"),
@@ -482,8 +493,9 @@ def _recall_tool(memory: PixeltableMemoryStore, *, max_rows: int, max_chars: int
                     "session_id": meta.get("session_id"),
                 }
             )
-            used += len(content)
-        return {"query": query, "memories": memories, "truncated": truncated}
+        return _bounded(
+            {"query": query}, memories, has_more=len(entries) > fetch, max_chars=max_chars, row_key="memories"
+        )
 
     return recall
 
@@ -531,7 +543,7 @@ def _query_table_tool(catalog: _Catalog) -> AgentTool:
             table: Pixeltable table path.
             columns: Columns to return. Omit to skip media, array, binary, and
                 computed columns that are not stored. A named media column is
-                returned as a file URL.
+                returned as a file URL. Unstored computed columns cannot be selected.
             where: JSON object of equality filters, for example
                 ``{"status": "open"}``. Timestamp, date, and UUID values are
                 ISO strings. Null matches null rows.

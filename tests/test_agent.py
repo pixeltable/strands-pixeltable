@@ -12,7 +12,7 @@ from strands_pixeltable import PixeltableMemoryStore, pixeltable_tools
 from tests.embed import tiny_embed
 
 
-def test_agent_registers_memory_and_catalog_tools() -> None:
+async def test_agent_registers_memory_and_catalog_tools() -> None:
     root = f"test_agent_{uuid.uuid4().hex[:8]}"
     try:
         store = PixeltableMemoryStore(table_name=f"{root}.memory", embedding=tiny_embed, name="notes")
@@ -27,7 +27,10 @@ def test_agent_registers_memory_and_catalog_tools() -> None:
         names = set(agent.tool_names)
         assert {"remember", "recall", "query_table", "similarity_search", "search_memory", "add_memory"} <= names
         assert agent.memory_manager is not None
-        assert agent.memory_manager._stores[0] is store
+        await agent.memory_manager.add("The user prefers aisle seats.")
+        found = await agent.memory_manager.search("The user prefers aisle seats.")
+        assert found[0].store_name == "notes"
+        assert found[0].content == "The user prefers aisle seats."
     finally:
         try:
             pxt.drop_dir(root, force=True)

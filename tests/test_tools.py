@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 
 from strands_pixeltable import PixeltableMemoryStore, pixeltable_tools
-from tests.embed import tiny_embed
+from tests.embed import observe_read, tiny_embed, tiny_image_embed
 
 
 def _root() -> str:
@@ -61,7 +61,7 @@ def catalog() -> str:
         ]
     )
     secret.insert([{"text": "do not show this"}])
-    docs.add_embedding_index("text", string_embed=tiny_embed, if_exists="ignore")
+    docs.add_embedding_index("text", string_embed=tiny_embed, idx_name="text_embedding", if_exists="ignore")
     yield root
     _drop(root)
 
@@ -137,7 +137,7 @@ async def test_prefix_allowlist_and_star(catalog: str) -> None:
 
 
 async def test_query_caps_and_timestamp_filter(catalog: str) -> None:
-    tools = pixeltable_tools([catalog], max_rows=1, max_chars=80)
+    tools = pixeltable_tools([catalog], max_rows=1, max_chars=130)
     queried = _tool(tools, "query_table")(f"{catalog}.docs", columns=["text"], limit=10)
     assert queried["truncated"] is True
     assert len(queried["rows"]) == 1
@@ -155,18 +155,107 @@ async def test_query_caps_and_timestamp_filter(catalog: str) -> None:
     assert created.isoformat()
 
 
-async def test_similarity_requires_one_modality(catalog: str, tmp_path: Path) -> None:
-    image = tmp_path / "cat.png"
-    Image.new("RGB", (2, 2), color="red").save(image)
+async def test_similarity_requires_one_modality(catalog: str) -> None:
     search = _tool(pixeltable_tools([catalog]), "similarity_search")
     with pytest.raises(ValueError, match="exactly one"):
         search(f"{catalog}.docs", column="text")
     with pytest.raises(ValueError, match="exactly one"):
-        search(f"{catalog}.docs", column="text", query="meals", image=str(image))
+        search(f"{catalog}.docs", column="text", query="meals", image="cat.jpg")
+
+
+@pytest.mark.parametrize("image", ["cat.jpg", "http://127.0.0.1/private.png"])
+def test_unsupported_image_search_does_not_open_or_fetch(
+    catalog: str, image: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("unsupported image search must not fetch or open its input")
+
+    monkeypatch.setattr("pixeltable.exprs.column_ref.fetch_url", fail)
+    monkeypatch.setattr(Image, "open", fail)
+    search = _tool(pixeltable_tools([catalog]), "similarity_search")
     with pytest.raises(ValueError, match="image embedding"):
-        search(f"{catalog}.docs", column="text", image=str(image))
-    with pytest.raises(ValueError, match="No such file"):
-        search(f"{catalog}.docs", column="text", image="cat.jpg")
+        search(f"{catalog}.docs", column="text", image=image)
+
+    docs = pxt.get_table(f"{catalog}.docs")
+    docs.add_embedding_index("text", string_embed=tiny_embed, image_embed=tiny_image_embed, idx_name="multimodal")
+    with pytest.raises(ValueError, match="image embedding"):
+        search(f"{catalog}.docs", column="text", image=image, idx="text_embedding")
+    with pytest.raises(ValueError, match="multiple embedding indices"):
+        search(f"{catalog}.docs", column="text", image=image)
+    with pytest.raises(ValueError, match="missing"):
+        search(f"{catalog}.docs", column="text", image=image, idx="missing")
+
+
+def test_image_similarity_returns_matching_row(catalog: str, tmp_path: Path) -> None:
+    red = tmp_path / "red.png"
+    blue = tmp_path / "blue.png"
+    Image.new("RGB", (2, 2), color="red").save(red)
+    Image.new("RGB", (2, 2), color="blue").save(blue)
+    images = pxt.create_table(f"{catalog}.images", {"label": pxt.String, "image": pxt.Image})
+    images.insert([{"label": "red", "image": str(red)}, {"label": "blue", "image": str(blue)}])
+    images.add_embedding_index("image", image_embed=tiny_image_embed, idx_name="image_embedding")
+    search = _tool(pixeltable_tools([catalog]), "similarity_search")
+    for idx in (None, "image_embedding"):
+        found = search(f"{catalog}.images", column="image", image=str(red), idx=idx)
+        assert found["rows"][0]["label"] == "red"
+        assert found["rows"][0]["image"].startswith("file:")
+        assert found["rows"][0]["score"] > found["rows"][1]["score"]
+
+
+def test_unstored_columns_are_rejected_without_running_udf(catalog: str, tmp_path: Path) -> None:
+    docs = pxt.get_table(f"{catalog}.docs")
+    marker = tmp_path / "computed-ran"
+    docs.add_computed_column(lazy=observe_read(docs.text, marker=str(marker)), stored=False)
+    docs.add_computed_column(stored_text=docs.text.upper())
+    tools = pixeltable_tools([catalog])
+    query = _tool(tools, "query_table")
+    search = _tool(tools, "similarity_search")
+    with pytest.raises(ValueError, match="computed on read"):
+        query(f"{catalog}.docs", columns=["lazy"])
+    with pytest.raises(ValueError, match="computed on read"):
+        search(f"{catalog}.docs", column="text", query="meals", columns=["lazy"])
+    with pytest.raises(ValueError, match="computed on read"):
+        query(f"{catalog}.docs", where=json.dumps({"lazy": "anything"}))
+    assert "lazy" not in query(f"{catalog}.docs")["rows"][0]
+    assert query(f"{catalog}.docs", columns=["stored_text"])["rows"]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("max_chars", [80, 110, 130])
+def test_query_character_budget(catalog: str, max_chars: int) -> None:
+    query = _tool(pixeltable_tools([catalog], max_chars=max_chars), "query_table")
+    result = query(f"{catalog}.docs")
+    assert result["truncated"] is True
+    assert len(json.dumps(result, ensure_ascii=False)) <= max_chars
+
+
+def test_query_rejects_budget_smaller_than_envelope(catalog: str) -> None:
+    query = _tool(pixeltable_tools([catalog], max_chars=1), "query_table")
+    with pytest.raises(ValueError, match="result envelope"):
+        query(f"{catalog}.docs")
+
+
+def test_query_shortens_string_to_fit_budget(catalog: str) -> None:
+    expected = {"table": f"{catalog}.docs", "rows": [{"text": "..."}], "truncated": True}
+    max_chars = len(json.dumps(expected, ensure_ascii=False))
+    query = _tool(pixeltable_tools([catalog], max_chars=max_chars), "query_table")
+    assert query(f"{catalog}.docs", columns=["text"]) == expected
+
+
+async def test_recall_caps_include_metadata_and_report_omitted_hits(catalog: str) -> None:
+    memory = PixeltableMemoryStore(table_name=f"{catalog}.memory", embedding=tiny_embed, session_id="s1")
+    await memory.add("same", {"session_id": "s2", "memory_id": "x" * 200})
+    await memory.add("other", {"session_id": "s2"})
+    recall = _tool(pixeltable_tools([catalog], memory=memory, max_rows=1, max_chars=250), "recall")
+    result = await recall("same", session_id="")
+    assert len(result["memories"]) == 1
+    assert result["memories"][0]["content"] == "same"
+    assert result["truncated"] is True
+    assert len(json.dumps(result, ensure_ascii=False)) <= 250
+
+    recall = _tool(pixeltable_tools([catalog], memory=memory, max_rows=1), "recall")
+    assert (await recall("same", session_id=""))["truncated"] is True
+    assert (await recall("same"))["memories"] == []
 
 
 async def test_remember_and_recall_round_trip(catalog: str) -> None:
