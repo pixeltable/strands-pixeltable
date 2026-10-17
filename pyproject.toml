@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]  # PEP 639 license metadata floor
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strands-pixeltable"
+version = "0.1.0"
+description = "Strands Agents memory store and read-only Pixeltable tools."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [
+    { name = "Pixeltable", email = "contact@pixeltable.com" },
+]
+keywords = ["strands", "strands-agents", "pixeltable", "memory", "agents", "rag"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    # MemoryStore (search/add/add_messages) shipped in 1.61.0 and is unchanged in 1.61.1.
+    "strands-agents>=1.61.0",
+    # create_table/get_table if_exists, add_computed_column, add_embedding_index, ColumnRef.similarity.
+    "pixeltable>=0.7.8",
+]
+
+[project.optional-dependencies]
+local = [
+    # Local sentence-transformers embeddings. No API key. Pixeltable requires >=5.4.
+    "sentence-transformers>=5.4",
+]
+dev = [
+    "mypy>=1.10",
+    "numpy",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff==0.16.8",
+    "build",
+]
+
+[project.urls]
+Homepage = "https://github.com/pixeltable/strands-pixeltable"
+Repository = "https://github.com/pixeltable/strands-pixeltable"
+Documentation = "https://github.com/pixeltable/strands-pixeltable#readme"
+Issues = "https://github.com/pixeltable/strands-pixeltable/issues"
+Discord = "https://discord.gg/QPyqFYx2UN"
+
+[tool.setuptools.packages.find]
+include = ["strands_pixeltable*"]
+
+[tool.setuptools.package-data]
+strands_pixeltable = ["py.typed"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
+]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["strands_pixeltable"]
+warn_unused_ignores = true
+warn_redundant_casts = true
